@@ -1,7 +1,18 @@
 use codex_plus_core::assets;
 use codex_plus_core::bridge::{self, BRIDGE_BINDING_NAME};
 use codex_plus_core::cdp::{CdpTarget, pick_page_target};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
 
 fn target(id: &str, kind: &str, title: &str, url: &str, websocket_url: Option<&str>) -> CdpTarget {
     CdpTarget {
@@ -158,4 +169,253 @@ fn pick_page_target_rejects_non_pages_and_pages_without_websocket() {
             .to_string()
             .contains("No injectable Codex page target found")
     );
+}
+
+#[tokio::test]
+async fn install_bridge_routes_binding_while_waiting_for_command_response() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=4 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        let evaluate = recv_json(&mut socket).await;
+        assert_eq!(evaluate["id"], 5);
+        assert_eq!(evaluate["method"], "Runtime.evaluate");
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "request-1",
+                        "path": "delete",
+                        "payload": { "target": "session" },
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+        send_json(&mut socket, json!({ "id": 5, "result": {} })).await;
+
+        let response = recv_json(&mut socket).await;
+        assert_eq!(response["method"], "Runtime.evaluate");
+        assert!(
+            response["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("__codexSessionDeleteResolve")
+        );
+        send_json(&mut socket, json!({ "id": response["id"], "result": {} })).await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handled = Arc::new(AtomicBool::new(false));
+    let handler = {
+        let handled = Arc::clone(&handled);
+        Arc::new(move |path: String, payload: serde_json::Value| {
+            let handled = Arc::clone(&handled);
+            Box::pin(async move {
+                assert_eq!(path, "delete");
+                assert_eq!(payload["target"], "session");
+                handled.store(true, Ordering::SeqCst);
+                Ok(json!({ "status": "ok" }))
+            })
+                as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+        })
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge should not hang while processing interleaved binding call")
+    .expect("bridge should keep processing interleaved binding call");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert!(handled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn install_bridge_command_error_mentions_method_and_id() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        let command = recv_json(&mut socket).await;
+        assert_eq!(command["method"], "Runtime.enable");
+        send_json(
+            &mut socket,
+            json!({
+                "id": command["id"],
+                "error": { "code": -32000, "message": "Runtime disabled" },
+            }),
+        )
+        .await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler = noop_handler();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge should not hang on CDP error response")
+    .expect_err("CDP error response should fail install");
+    let message = error.to_string();
+
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert!(message.contains("Runtime.enable"), "{message}");
+    assert!(message.contains("id 1"), "{message}");
+    assert!(message.contains("Runtime disabled"), "{message}");
+}
+
+#[tokio::test]
+async fn install_bridge_rejects_bad_payload_with_id_and_continues_after_unparseable_payload() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": { "payload": "{\"id\":\"bad-1\",\"payload\":{}" },
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": { "payload": "not json" },
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "ok-1",
+                        "path": "delete",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let reject = recv_json(&mut socket).await;
+        assert!(
+            reject["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("__codexSessionDeleteReject")
+        );
+        assert!(
+            reject["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("bad-1")
+        );
+        send_json(&mut socket, json!({ "id": reject["id"], "result": {} })).await;
+
+        let resolve = recv_json(&mut socket).await;
+        assert!(
+            resolve["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("__codexSessionDeleteResolve")
+        );
+        assert!(
+            resolve["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("ok-1")
+        );
+        send_json(&mut socket, json!({ "id": resolve["id"], "result": {} })).await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
+    )
+    .await
+    .expect("bridge should not hang after bad payload")
+    .expect("bad payloads should not terminate the bridge loop");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
+type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+async fn spawn_cdp_server<F, Fut>(handler: F) -> (String, oneshot::Receiver<()>)
+where
+    F: FnOnce(TestSocket) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let (done_tx, done_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let socket = accept_async(stream)
+            .await
+            .expect("websocket should upgrade");
+        handler(socket).await;
+        let _ = done_tx.send(());
+    });
+
+    (websocket_url(address), done_rx)
+}
+
+fn websocket_url(address: SocketAddr) -> String {
+    format!("ws://{address}")
+}
+
+async fn recv_json(socket: &mut TestSocket) -> serde_json::Value {
+    let message = socket
+        .next()
+        .await
+        .expect("client should send message")
+        .expect("message should be readable");
+    let Message::Text(text) = message else {
+        panic!("expected text websocket message");
+    };
+    serde_json::from_str(&text).expect("message should be JSON")
+}
+
+async fn send_json(socket: &mut TestSocket, value: serde_json::Value) {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .expect("message should send");
+}
+
+async fn close_socket(socket: &mut TestSocket) {
+    socket.close(None).await.expect("websocket should close");
+    let _ = tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
+}
+
+fn noop_handler() -> bridge::BridgeHandler {
+    Arc::new(|_, _| {
+        Box::pin(async { Ok(json!({ "status": "ok" })) })
+            as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+    })
 }

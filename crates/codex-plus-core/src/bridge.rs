@@ -1,15 +1,19 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 pub const BRIDGE_BINDING_NAME: &str = "codexSessionDeleteV2";
+const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type BridgeHandler = Arc<
     dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>
@@ -48,36 +52,34 @@ pub fn build_bridge_script(binding_name: &str) -> String {
 }
 
 pub async fn evaluate_script(websocket_url: &str, script: &str) -> anyhow::Result<Value> {
-    let (mut socket, _) = connect_async(websocket_url)
+    let socket = connect_cdp_websocket(websocket_url).await?;
+    let mut session = CdpSession::new(socket);
+    session
+        .send_command(
+            1,
+            "Runtime.evaluate",
+            json!({
+                "expression": script,
+                "awaitPromise": false,
+                "allowUnsafeEvalBlockedByCSP": true,
+            }),
+        )
         .await
-        .context("failed to connect CDP websocket")?;
-    send_command(
-        &mut socket,
-        1,
-        "Runtime.evaluate",
-        json!({
-            "expression": script,
-            "awaitPromise": false,
-            "allowUnsafeEvalBlockedByCSP": true,
-        }),
-    )
-    .await
 }
 
 pub async fn add_script_to_new_documents(
     websocket_url: &str,
     script: &str,
 ) -> anyhow::Result<Value> {
-    let (mut socket, _) = connect_async(websocket_url)
+    let socket = connect_cdp_websocket(websocket_url).await?;
+    let mut session = CdpSession::new(socket);
+    session
+        .send_command(
+            1,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": script }),
+        )
         .await
-        .context("failed to connect CDP websocket")?;
-    send_command(
-        &mut socket,
-        1,
-        "Page.addScriptToEvaluateOnNewDocument",
-        json!({ "source": script }),
-    )
-    .await
 }
 
 pub async fn install_bridge(
@@ -86,64 +88,45 @@ pub async fn install_bridge(
     handler: BridgeHandler,
     new_document_scripts: &[String],
 ) -> anyhow::Result<()> {
-    let (mut socket, _) = connect_async(websocket_url)
-        .await
-        .context("failed to connect CDP websocket")?;
+    let socket = connect_cdp_websocket(websocket_url).await?;
+    let mut session = CdpSession::new(socket).with_handler(handler);
 
-    send_command(&mut socket, 1, "Runtime.enable", json!({})).await?;
-    send_command(
-        &mut socket,
-        2,
-        "Runtime.removeBinding",
-        json!({ "name": binding_name }),
-    )
-    .await?;
-    send_command(
-        &mut socket,
-        3,
-        "Runtime.addBinding",
-        json!({ "name": binding_name }),
-    )
-    .await?;
+    session.send_command(1, "Runtime.enable", json!({})).await?;
+    session
+        .send_command(2, "Runtime.removeBinding", json!({ "name": binding_name }))
+        .await?;
+    session
+        .send_command(3, "Runtime.addBinding", json!({ "name": binding_name }))
+        .await?;
 
     let bridge_script = build_bridge_script(binding_name);
-    send_command(
-        &mut socket,
-        4,
-        "Page.addScriptToEvaluateOnNewDocument",
-        json!({ "source": bridge_script }),
-    )
-    .await?;
-    send_command(
-        &mut socket,
-        5,
-        "Runtime.evaluate",
-        runtime_evaluate_params(&bridge_script),
-    )
-    .await?;
+    session
+        .send_command(
+            4,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": bridge_script }),
+        )
+        .await?;
+    session
+        .send_command(
+            5,
+            "Runtime.evaluate",
+            runtime_evaluate_params(&bridge_script),
+        )
+        .await?;
 
     for script in new_document_scripts {
         let message_id = next_message_id();
-        send_command(
-            &mut socket,
-            message_id,
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": script }),
-        )
-        .await?;
+        session
+            .send_command(
+                message_id,
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": script }),
+            )
+            .await?;
     }
 
-    while let Some(message) = socket.next().await {
-        let message = message.context("failed to read CDP websocket message")?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text).context("failed to parse CDP message")?;
-        if value.get("method").and_then(Value::as_str) != Some("Runtime.bindingCalled") {
-            continue;
-        }
-        route_binding_call(&mut socket, &handler, value).await?;
-    }
+    while session.next_message().await?.is_some() {}
 
     Ok(())
 }
@@ -172,108 +155,254 @@ pub fn reject_bridge_expression(request_id: &str, message: &str) -> anyhow::Resu
     ))
 }
 
-async fn route_binding_call<S>(
-    socket: &mut S,
-    handler: &BridgeHandler,
-    message: Value,
-) -> anyhow::Result<()>
+async fn connect_cdp_websocket(
+    websocket_url: &str,
+) -> anyhow::Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let (socket, _) = tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(websocket_url))
+        .await
+        .with_context(|| {
+            format!(
+                "timed out connecting CDP websocket after {}s",
+                CDP_CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .context("failed to connect CDP websocket")?;
+
+    Ok(socket)
+}
+
+struct CdpSession<S> {
+    socket: S,
+    responses: HashMap<u64, Value>,
+    handler: Option<BridgeHandler>,
+}
+
+impl<S> CdpSession<S>
 where
     S: SinkExt<Message>
         + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
-    let payload = message
-        .get("params")
-        .and_then(|params| params.get("payload"))
-        .and_then(Value::as_str)
-        .unwrap_or("{}");
-    let parsed: Value = serde_json::from_str(payload).context("failed to parse bridge payload")?;
-    let request_id = parsed
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("bridge payload missing id"))?;
-    let path = parsed
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
-
-    match handler(path, payload).await {
-        Ok(result) => {
-            let expression = resolve_bridge_expression(request_id, &result)?;
-            send_command(
-                socket,
-                next_message_id(),
-                "Runtime.evaluate",
-                runtime_evaluate_params(&expression),
-            )
-            .await?;
-        }
-        Err(error) => {
-            let expression = reject_bridge_expression(request_id, &error.to_string())?;
-            send_command(
-                socket,
-                next_message_id(),
-                "Runtime.evaluate",
-                runtime_evaluate_params(&expression),
-            )
-            .await?;
+    fn new(socket: S) -> Self {
+        Self {
+            socket,
+            responses: HashMap::new(),
+            handler: None,
         }
     }
 
-    Ok(())
-}
+    fn with_handler(mut self, handler: BridgeHandler) -> Self {
+        self.handler = Some(handler);
+        self
+    }
 
-async fn send_command<S>(
-    socket: &mut S,
-    message_id: u64,
-    method: &str,
-    params: Value,
-) -> anyhow::Result<Value>
-where
-    S: SinkExt<Message>
-        + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
-    <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
-{
-    socket
-        .send(Message::Text(
-            json!({
-                "id": message_id,
-                "method": method,
-                "params": params,
-            })
-            .to_string()
-            .into(),
-        ))
+    async fn send_command(
+        &mut self,
+        message_id: u64,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        self.socket
+            .send(Message::Text(
+                json!({
+                    "id": message_id,
+                    "method": method,
+                    "params": params,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .with_context(|| format!("failed to send CDP command {method} id {message_id}"))?;
+
+        tokio::time::timeout(
+            CDP_COMMAND_TIMEOUT,
+            self.wait_for_id(message_id, method.to_string()),
+        )
         .await
-        .context("failed to send CDP command")?;
+        .with_context(|| {
+            format!(
+                "timed out waiting for CDP command {method} id {message_id} response after {}s",
+                CDP_COMMAND_TIMEOUT.as_secs()
+            )
+        })?
+    }
 
-    wait_for_id(socket, message_id).await
-}
+    async fn wait_for_id(&mut self, message_id: u64, method: String) -> anyhow::Result<Value> {
+        loop {
+            if let Some(response) = self.responses.remove(&message_id) {
+                return command_result(response, &method, message_id);
+            }
 
-async fn wait_for_id<S>(socket: &mut S, message_id: u64) -> anyhow::Result<Value>
-where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    while let Some(message) = socket.next().await {
+            let Some(message) = self.next_message().await? else {
+                bail!("CDP websocket closed before response for {method} id {message_id}");
+            };
+
+            if let Some(response_id) = message.get("id").and_then(Value::as_u64) {
+                if response_id == message_id {
+                    return command_result(message, &method, message_id);
+                }
+                self.responses.insert(response_id, message);
+            }
+        }
+    }
+
+    async fn next_message(&mut self) -> anyhow::Result<Option<Value>> {
+        let Some(message) = self.socket.next().await else {
+            return Ok(None);
+        };
         let message = message.context("failed to read CDP websocket message")?;
         let Message::Text(text) = message else {
-            continue;
+            return Ok(Some(json!({})));
         };
-        let value: Value = serde_json::from_str(&text).context("failed to parse CDP response")?;
-        if value.get("id").and_then(Value::as_u64) != Some(message_id) {
-            continue;
+        let value: Value = serde_json::from_str(&text).context("failed to parse CDP message")?;
+
+        if value.get("method").and_then(Value::as_str) == Some("Runtime.bindingCalled") {
+            self.route_binding_call(value.clone()).await?;
         }
-        if let Some(error) = value.get("error") {
-            return Err(anyhow!("CDP command failed: {error}"));
-        }
-        return Ok(value);
+
+        Ok(Some(value))
     }
 
-    Err(anyhow!("CDP websocket closed before response {message_id}"))
+    fn route_binding_call(
+        &mut self,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
+        Box::pin(async move {
+            let Some(handler) = self.handler.clone() else {
+                return Ok(());
+            };
+
+            let Some(payload_text) = message
+                .get("params")
+                .and_then(|params| params.get("payload"))
+                .and_then(Value::as_str)
+            else {
+                return Ok(());
+            };
+
+            let parsed: Value = match serde_json::from_str(payload_text) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    if let Some(request_id) = extract_string_field(payload_text, "id") {
+                        self.reject_bridge_request(
+                            &request_id,
+                            &format!("failed to parse bridge payload: {error}"),
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
+            };
+            self.route_parsed_binding_call(&handler, parsed).await
+        })
+    }
+
+    async fn route_parsed_binding_call(
+        &mut self,
+        handler: &BridgeHandler,
+        parsed: Value,
+    ) -> anyhow::Result<()> {
+        let Some(request_id) = parsed.get("id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let path = parsed
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
+
+        match handler(path, payload).await {
+            Ok(result) => {
+                self.resolve_bridge_request(request_id, &result).await?;
+            }
+            Err(error) => {
+                self.reject_bridge_request(request_id, &error.to_string())
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_bridge_request(
+        &mut self,
+        request_id: &str,
+        result: &Value,
+    ) -> anyhow::Result<()> {
+        let expression = resolve_bridge_expression(request_id, result)?;
+        self.send_command(
+            next_message_id(),
+            "Runtime.evaluate",
+            runtime_evaluate_params(&expression),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn reject_bridge_request(
+        &mut self,
+        request_id: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let expression = reject_bridge_expression(request_id, message)?;
+        self.send_command(
+            next_message_id(),
+            "Runtime.evaluate",
+            runtime_evaluate_params(&expression),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+fn command_result(response: Value, method: &str, message_id: u64) -> anyhow::Result<Value> {
+    if let Some(error) = response.get("error") {
+        bail!("CDP command {method} id {message_id} failed: {error}");
+    }
+    Ok(response)
+}
+
+fn extract_string_field(input: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let mut index = input.find(&needle)? + needle.len();
+    let bytes = input.as_bytes();
+
+    while matches!(bytes.get(index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b':') {
+        return None;
+    }
+    index += 1;
+    while matches!(bytes.get(index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'"') {
+        return None;
+    }
+    index += 1;
+
+    let mut output = String::new();
+    let mut escaped = false;
+    for ch in input[index..].chars() {
+        if escaped {
+            output.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(output),
+            _ => output.push(ch),
+        }
+    }
+
+    None
 }
 
 fn next_message_id() -> u64 {
