@@ -350,7 +350,7 @@ fn macos_app_candidates(root: &Path) -> Vec<PathBuf> {
     if root.extension() == Some(OsStr::new("app")) {
         return vec![root.to_path_buf()];
     }
-    [
+[
         "Codex.app",
         "OpenAI Codex.app",
         "OpenAI.Codex.app",
