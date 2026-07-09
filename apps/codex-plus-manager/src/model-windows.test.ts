@@ -32,6 +32,8 @@ const _profileTypeCheck: RelayProfile = {
   modelList: "",
   modelWindows: "",
   userAgent: "",
+  useEnvApiKey: false,
+  apiKeyEnvName: "",
 };
 
 void _profileTypeCheck;

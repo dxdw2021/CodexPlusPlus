@@ -35,6 +35,7 @@ pub struct RelayConfigStatus {
     pub configured: bool,
     pub requires_openai_auth: bool,
     pub has_bearer_token: bool,
+    pub has_env_key: bool,
     pub config_path: String,
 }
 
@@ -48,6 +49,7 @@ pub struct RelayStatus {
     pub configured: bool,
     pub requires_openai_auth: bool,
     pub has_bearer_token: bool,
+    pub has_env_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -169,6 +171,7 @@ pub fn relay_status_from_home(home: &Path) -> RelayStatus {
         configured: config.configured,
         requires_openai_auth: config.requires_openai_auth,
         has_bearer_token: config.has_bearer_token,
+        has_env_key: config.has_env_key,
     }
 }
 
@@ -210,6 +213,11 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
         .map(|value| unquote_toml_string(value).trim().to_string())
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
+    let has_env_key = provider
+        .as_ref()
+        .and_then(|values| values.get("env_key"))
+        .map(|value| !unquote_toml_string(value).trim().is_empty())
+        .unwrap_or(false);
     let has_base_url = provider
         .as_ref()
         .and_then(|values| values.get("base_url"))
@@ -217,11 +225,13 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
         .unwrap_or(false);
     RelayConfigStatus {
         configured: root_provider.is_some()
-            && requires_openai_auth
-            && (has_bearer_token || codex_auth_api_key(&auth_contents).is_some())
+            && (requires_openai_auth
+                && (has_bearer_token || codex_auth_api_key(&auth_contents).is_some())
+                || has_env_key)
             && has_base_url,
         requires_openai_auth,
         has_bearer_token,
+        has_env_key,
         config_path: config_path.to_string_lossy().to_string(),
     }
 }
@@ -1922,6 +1932,13 @@ pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
     if profile.relay_mode == crate::settings::RelayMode::Aggregate {
         return "codex-plus-aggregate".to_string();
     }
+    // 环境变量模式：从环境变量读取 Key，用于测试请求和诊断
+    if profile.use_env_api_key && !profile.api_key_env_name.trim().is_empty() {
+        return std::env::var(profile.api_key_env_name.trim())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
     if profile.relay_mode == crate::settings::RelayMode::Official {
         return experimental_bearer_token_from_config(&profile.config_contents)
             .ok()
@@ -2006,9 +2023,17 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
         provider["base_url"] = toml_edit::value(provider_base_url.trim());
     }
     if profile.relay_mode == crate::settings::RelayMode::PureApi {
-        provider.remove("experimental_bearer_token");
+        if profile.use_env_api_key && !profile.api_key_env_name.trim().is_empty() {
+            provider.remove("experimental_bearer_token");
+            provider["env_key"] = toml_edit::value(profile.api_key_env_name.trim());
+            provider["requires_openai_auth"] = toml_edit::value(false);
+        } else {
+            provider.remove("experimental_bearer_token");
+            provider.remove("env_key");
+        }
     } else if !api_key.trim().is_empty() {
         provider["experimental_bearer_token"] = toml_edit::value(api_key.trim());
+        provider.remove("env_key");
     }
 
     Ok(move_model_providers_before_profiles(

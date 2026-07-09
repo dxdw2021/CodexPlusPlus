@@ -209,6 +209,8 @@ export type RelayProfile = {
   modelList: string;
   modelWindows: string;
   userAgent: string;
+  useEnvApiKey: boolean;
+  apiKeyEnvName: string;
   aggregate?: RelayAggregateConfig | null;
 };
 
@@ -719,6 +721,8 @@ const defaultSettings: BackendSettings = {
       modelList: "",
       modelWindows: "",
       userAgent: "",
+      useEnvApiKey: false,
+      apiKeyEnvName: "",
     },
   ],
   relayCommonConfigContents: "",
@@ -4178,12 +4182,41 @@ function RelayProfileEditor({
               />
             </Field>
             <Field className="relay-field-key" label="Key">
-              <Input
-                type="password"
-                value={profile.apiKey}
-                onChange={(event) => updateDraft({ apiKey: event.currentTarget.value })}
-                placeholder={t("输入中转服务的 API Key")}
-              />
+              {profile.useEnvApiKey ? (
+                <div className="relay-env-key">
+                  <Input
+                    value={profile.apiKeyEnvName}
+                    onChange={(event) => updateDraft({ apiKeyEnvName: event.currentTarget.value })}
+                    placeholder={t("例如 ARK_API_KEY")}
+                  />
+                  <label className="inline-check">
+                    <input
+                      checked={profile.useEnvApiKey}
+                      onChange={(event) => updateDraft({ useEnvApiKey: event.currentTarget.checked, apiKey: "" })}
+                      type="checkbox"
+                    />
+                    <span>{t("使用环境变量")}</span>
+                  </label>
+                  <p className="field-hint">{t("Key 从环境变量读取，不在 settings.json / auth.json 中落盘。请在下一步设置该环境变量的值。")}</p>
+                </div>
+              ) : (
+                <div className="relay-env-key">
+                  <Input
+                    type="password"
+                    value={profile.apiKey}
+                    onChange={(event) => updateDraft({ apiKey: event.currentTarget.value })}
+                    placeholder={t("输入中转服务的 API Key")}
+                  />
+                  <label className="inline-check">
+                    <input
+                      checked={false}
+                      onChange={(event) => updateDraft({ useEnvApiKey: event.currentTarget.checked, apiKeyEnvName: "", apiKey: "" })}
+                      type="checkbox"
+                    />
+                    <span>{t("使用环境变量")}</span>
+                  </label>
+                </div>
+              )}
             </Field>
             <Field className="relay-field-protocol" label={t("上游协议")}>
               <div className="protocol-options">
@@ -5971,6 +6004,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             modelList: "",
             modelWindows: "",
             userAgent: "",
+            useEnvApiKey: false,
+            apiKeyEnvName: "",
           },
         ];
   const activeRelayId = profiles.some((profile) => profile.id === settings.activeRelayId)
@@ -6038,6 +6073,8 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         autoCompactLimit: "",
         modelList: "",
         modelWindows: "",
+        useEnvApiKey: false,
+        apiKeyEnvName: "",
       },
       null,
     );
@@ -6066,6 +6103,8 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     modelList: profile.modelList || "",
     modelWindows: profile.modelWindows || "",
     userAgent: profile.userAgent || "",
+    useEnvApiKey: profile.useEnvApiKey === true,
+    apiKeyEnvName: profile.apiKeyEnvName || "",
     aggregate: null,
   };
   return relayProfileUsesLiveFiles(normalized) ? deriveRelayProfileFromFiles(normalized) : normalized;
@@ -6240,29 +6279,35 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol">,
+  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "useEnvApiKey" | "apiKeyEnvName">,
   options: { includeBearerToken: boolean },
 ): string {
   const baseUrl = profile.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
+  const useEnv = profile.useEnvApiKey && profile.apiKeyEnvName.trim();
   const rootLines = [
     profile.model.trim() ? `model = "${tomlString(profile.model.trim())}"` : null,
     'model_provider = "custom"',
     "",
   ].filter((line): line is string => line !== null);
-  return [
-    ...rootLines,
+  const providerLines = [
     "[model_providers.custom]",
     'name = "custom"',
     'wire_api = "responses"',
-    "requires_openai_auth = true",
+    useEnv ? "requires_openai_auth = false" : "requires_openai_auth = true",
     `base_url = "${tomlString(baseUrl)}"`,
+    useEnv ? `env_key = "${tomlString(profile.apiKeyEnvName.trim())}"` : null,
     options.includeBearerToken && apiKey ? `experimental_bearer_token = "${tomlString(apiKey)}"` : null,
     "",
-  ].filter((line): line is string => line !== null).join("\n");
+  ].filter((line): line is string => line !== null);
+  return [...rootLines, ...providerLines].join("\n");
 }
 
-function buildRelayAuthJson(profile: Pick<RelayProfile, "apiKey">): string {
+function buildRelayAuthJson(profile: Pick<RelayProfile, "apiKey" | "useEnvApiKey" | "apiKeyEnvName">): string {
+  if (profile.useEnvApiKey && profile.apiKeyEnvName.trim()) {
+    // 环境变量模式：不写入 auth.json，Codex 从环境变量读取 Key
+    return `${JSON.stringify({}, null, 2)}\n`;
+  }
   return `${JSON.stringify({ OPENAI_API_KEY: profile.apiKey.trim() }, null, 2)}\n`;
 }
 
@@ -6290,6 +6335,7 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
   const isProxyConfig = configBaseUrl === PROTOCOL_PROXY_BASE_URL;
   const upstreamBaseUrl = profile.upstreamBaseUrl || chatUpstreamBaseUrl || (configBaseUrl && !isProxyConfig ? configBaseUrl : profile.baseUrl || "");
   const configApiKey = codexExperimentalBearerTokenFromConfig(configContents);
+  const configEnvKey = codexEnvKeyFromConfig(configContents);
   const configModel = codexModelFromConfig(configContents);
   // 如果用户输入了带后缀的模型名，优先保留在界面的「配置模型」字段中；
   // config.toml 里实际写的是剥离后缀的 slug（由 applyRelayProfilePatchToFiles 处理）。
@@ -6302,6 +6348,8 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
     apiKey: profile.relayMode === "official"
       ? configApiKey || profile.apiKey || ""
       : codexApiKeyFromAuth(authContents) || configApiKey || "",
+    useEnvApiKey: profile.useEnvApiKey || !!configEnvKey,
+    apiKeyEnvName: configEnvKey || profile.apiKeyEnvName || "",
     contextWindow: codexTopLevelIntFromConfig(configContents, "model_context_window"),
     autoCompactLimit: codexTopLevelIntFromConfig(configContents, "model_auto_compact_token_limit"),
     configContents,
@@ -6332,7 +6380,10 @@ function applyRelayProfilePatchToFiles(
     next.configContents = setRootTomlStringKey(next.configContents, "model", slug);
   }
   if ("apiKey" in patch) {
-    if (next.relayMode === "pureApi") {
+    if (next.relayMode === "pureApi" && next.useEnvApiKey && next.apiKeyEnvName.trim()) {
+      // 环境变量模式：不写入 auth.json，config.toml 的 env_key 由 withGeneratedRelayFiles 生成
+      next.authContents = buildRelayAuthJson(next);
+    } else if (next.relayMode === "pureApi") {
       next.authContents = setAuthOpenAiApiKey(next.authContents, patch.apiKey || "");
       next.configContents = removeCodexExperimentalBearerToken(next.configContents);
     } else {
@@ -6365,6 +6416,13 @@ function applyRelayProfilePatchToFiles(
       next.configContents = "";
       next.authContents = buildOfficialRelayAuthJson(next.authContents);
     } else if (options.allowGenerateFiles && (!next.configContents.trim() || (next.relayMode === "pureApi" && !next.authContents.trim()))) {
+      next = withGeneratedRelayFiles(next);
+    }
+  }
+
+  if ((!("relayMode" in patch) || next.relayMode === "pureApi") && ("useEnvApiKey" in patch || "apiKeyEnvName" in patch)) {
+    // 环境变量开关变化时，重新生成文件
+    if (options.allowGenerateFiles) {
       next = withGeneratedRelayFiles(next);
     }
   }
@@ -6405,6 +6463,10 @@ function codexBaseUrlFromConfig(contents: string): string {
 
 function codexExperimentalBearerTokenFromConfig(contents: string): string {
   return codexProviderStringFromConfig(contents, "experimental_bearer_token");
+}
+
+function codexEnvKeyFromConfig(contents: string): string {
+  return codexProviderStringFromConfig(contents, "env_key");
 }
 
 function codexProviderStringFromConfig(contents: string, key: string): string {
@@ -6702,6 +6764,8 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     modelList: "",
     modelWindows: "",
     userAgent: "",
+    useEnvApiKey: false,
+    apiKeyEnvName: "",
   };
   return withGeneratedRelayFiles(next);
 }
@@ -6732,6 +6796,8 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       modelList: "",
       modelWindows: "",
       userAgent: "",
+      useEnvApiKey: false,
+      apiKeyEnvName: "",
       aggregate: {
         strategy: "failover",
         members: candidates.slice(0, 1).map((profile) => ({ profileId: profile.id, weight: 1 })),

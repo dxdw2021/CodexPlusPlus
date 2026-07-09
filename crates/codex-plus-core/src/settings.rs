@@ -93,6 +93,10 @@ pub struct RelayProfile {
         skip_serializing_if = "String::is_empty"
     )]
     pub user_agent: String,
+    #[serde(rename = "useEnvApiKey", default)]
+    pub use_env_api_key: bool,
+    #[serde(rename = "apiKeyEnvName", default)]
+    pub api_key_env_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -149,6 +153,8 @@ impl Default for RelayProfile {
             model_list: String::new(),
             model_windows: String::new(),
             user_agent: String::new(),
+            use_env_api_key: false,
+            api_key_env_name: String::new(),
         }
     }
 }
@@ -417,6 +423,8 @@ impl BackendSettings {
                 model_list: String::new(),
                 model_windows: String::new(),
                 user_agent: String::new(),
+                use_env_api_key: false,
+                api_key_env_name: String::new(),
             };
         }
 
@@ -462,6 +470,8 @@ impl BackendSettings {
             model_list: String::new(),
             model_windows: String::new(),
             user_agent: String::new(),
+            use_env_api_key: false,
+            api_key_env_name: String::new(),
         }
     }
 

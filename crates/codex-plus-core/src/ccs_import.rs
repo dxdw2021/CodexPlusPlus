@@ -100,6 +100,8 @@ pub fn relay_profile_from_ccs(
         model_list: String::new(),
         model_windows: String::new(),
         user_agent: String::new(),
+        use_env_api_key: false,
+        api_key_env_name: String::new(),
     }
 }
 

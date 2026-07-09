@@ -42,6 +42,8 @@ pub fn run() {
                 main_window_builder = main_window_builder.icon(icon)?;
             }
             let main_window = main_window_builder.build()?;
+            #[cfg(debug_assertions)]
+            main_window.open_devtools();
             install_tray(app)?;
             register_main_window_events(main_window);
             Ok(())

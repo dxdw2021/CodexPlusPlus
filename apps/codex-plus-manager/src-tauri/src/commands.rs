@@ -142,6 +142,7 @@ pub struct RelayPayload {
     pub configured: bool,
     pub requires_openai_auth: bool,
     pub has_bearer_token: bool,
+    pub has_env_key: bool,
     pub backup_path: Option<String>,
 }
 
@@ -2827,6 +2828,7 @@ fn log_relay_apply_result(
             "configured": status.configured,
             "requiresOpenaiAuth": status.requires_openai_auth,
             "hasBearerToken": status.has_bearer_token,
+            "hasEnvKey": status.has_env_key,
             "backupPath": backup_path,
             "error": error
         }),
@@ -2871,6 +2873,7 @@ fn relay_payload(
         configured: status.configured,
         requires_openai_auth: status.requires_openai_auth,
         has_bearer_token: status.has_bearer_token,
+        has_env_key: status.has_env_key,
         backup_path,
     }
 }
@@ -3366,6 +3369,7 @@ mod tests {
                 configured: true,
                 requires_openai_auth: true,
                 has_bearer_token: true,
+                has_env_key: false,
             },
             None,
         );
