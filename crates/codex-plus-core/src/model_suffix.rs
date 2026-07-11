@@ -287,6 +287,7 @@ fn first_bundled_template_entry() -> Option<Value> {
     let catalog: Value = serde_json::from_str(BUNDLED_TEMPLATE_JSON).ok()?;
     catalog.get("models")?.as_array()?.first().cloned()
 }
+}
 
 fn gpt56_metadata_entry(slug: &str) -> Option<Value> {
     let catalog: Value = serde_json::from_str(GPT56_METADATA_JSON).ok()?;
