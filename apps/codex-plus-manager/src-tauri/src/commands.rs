@@ -500,7 +500,124 @@ fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
     args.push(request.debug_port.to_string());
     args.push("--helper-port".to_string());
     args.push(request.helper_port.to_string());
-    codex_plus_core::install::spawn_companion(SILENT_BINARY, &args).map(|_| ())
+    // 先启动 companion（确保 Codex 被正确启动）
+    let result = codex_plus_core::install::spawn_companion(SILENT_BINARY, &args).map(|_| ());
+
+    // 再后台启动独立 node 进程（等待 CDP → 注入 Dream Skin）
+    // 放在 companion 之后，确保管理工具关闭不影响 companion 启动
+    if result.is_ok() {
+        let debug_port = request.debug_port;
+        std::thread::spawn(move || {
+            try_spawn_dream_skin_helper(debug_port);
+        });
+    }
+
+    result
+}
+
+/// 如果基础主题已安装，启动独立 node 进程等待 CDP 并注入 Dream Skin
+/// 该进程 detached = true，独立于管理工具生命周期
+pub fn try_spawn_dream_skin_helper(debug_port: u16) {
+    // 检查 config.toml 中是否有主题标记（比 settings 更可靠）
+    let theme_installed = codex_plus_core::dream_skin::check_base_theme_installed();
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "manager.dream_skin_check_base_theme",
+        json!({"debug_port": debug_port, "installed": theme_installed}),
+    );
+    if !theme_installed {
+        return;
+    }
+    let Some(node_path) = codex_plus_core::dream_skin::find_node() else {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.dream_skin_no_node",
+            json!({"debug_port": debug_port}),
+        );
+        return;
+    };
+    let assets_dir = codex_plus_core::dream_skin::dream_skin_assets_dir();
+    let injector_script = assets_dir.join("scripts").join("injector.mjs");
+    if !injector_script.exists() {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.dream_skin_no_injector_script",
+            json!({"debug_port": debug_port, "path": injector_script.to_string_lossy()}),
+        );
+        return;
+    }
+
+    let injector_script_str = injector_script.to_string_lossy().to_string();
+        let injector_script_json = serde_json::to_string(&injector_script_str).unwrap_or_default();
+
+        // 写入临时 helper 脚本文件（避免 node -e 命令行过长/引号冲突）
+        let helper_js = format!(
+            "const http = require('http');
+    const {{ spawn }} = require('child_process');
+    const port = {port};
+    const injectorScript = {injector_script_json};
+
+    function sleep(ms) {{ return new Promise(r => setTimeout(r, ms)); }}
+    function fetchJson(url) {{
+      return new Promise((resolve, reject) => {{
+        http.get(url, res => {{
+          let data = '';
+          res.on('data', c => data += c);
+          res.on('end', () => {{ try {{ resolve(JSON.parse(data)); }} catch(e) {{ reject(e); }} }});
+        }}).on('error', reject);
+      }});
+    }}
+
+    (async () => {{
+      for (let i = 0; i < 120; i++) {{
+        try {{
+          const version = await fetchJson(`http://127.0.0.1:${{port}}/json/version`);
+          const browserId = version.webSocketDebuggerUrl?.match(/\\/devtools\\/browser\\/([A-Za-z0-9._-]+)$/)?.[1];
+          if (browserId) {{
+            const child = spawn(process.execPath, [injectorScript,
+              '--watch', '--port', String(port), '--browser-id', browserId
+            ], {{ stdio: 'ignore', detached: true }});
+            child.on('error', (err) => {{
+              console.error('injector spawn failed:', err.message);
+              process.exit(2);
+            }});
+            child.unref();
+            // 给 injector 一点时间启动
+            await sleep(2000);
+            process.exit(0);
+          }}
+        }} catch(e) {{
+          console.error('helper error:', e?.message || e);
+        }}
+        await sleep(1000);
+      }}
+      process.exit(1);
+    }})();
+    ",
+            port = debug_port,
+            injector_script_json = injector_script_json,
+        );
+
+        // 写入临时文件
+        let helper_path = assets_dir.join("scripts").join("_dream_skin_helper.cjs");
+        let _ = std::fs::write(&helper_path, helper_js.as_bytes());
+
+        match std::process::Command::new(&node_path)
+            .arg(helper_path.to_string_lossy().as_ref())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    {
+        Ok(_) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_helper_spawned",
+                json!({"debug_port": debug_port, "node": node_path.to_string_lossy(), "injector": injector_script_str}),
+            );
+        }
+        Err(e) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_helper_spawn_failed",
+                json!({"debug_port": debug_port, "error": e.to_string()}),
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -3410,6 +3527,74 @@ fn default_helper_port() -> u16 {
 
 fn default_log_lines() -> usize {
     200
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub fn get_dream_skin_status() -> CommandResult<codex_plus_core::dream_skin::DreamSkinStatus> {
+    let status = codex_plus_core::dream_skin::get_dream_skin_status();
+    let msg = status.message.clone();
+    ok(&msg, status)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub async fn install_dream_skin() -> CommandResult<codex_plus_core::dream_skin::DreamSkinStatus> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        codex_plus_core::dream_skin::install_dream_skin()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("install_dream_skin task failed: {e}"))
+    .and_then(|r| r);
+    match result {
+        Ok(status) => ok("Codex 主题基础主题已安装。", status),
+        Err(_e) => failed("安装失败", codex_plus_core::dream_skin::get_dream_skin_status()),
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub async fn restore_dream_skin_base() -> CommandResult<codex_plus_core::dream_skin::DreamSkinStatus> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        codex_plus_core::dream_skin::restore_dream_skin_base()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("restore_dream_skin_base task failed: {e}"))
+    .and_then(|r| r);
+    match result {
+        Ok(status) => ok("Codex 主题基础主题已恢复。", status),
+        Err(_e) => failed("恢复失败", codex_plus_core::dream_skin::get_dream_skin_status()),
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub async fn start_dream_skin_injector(port: u16) -> CommandResult<codex_plus_core::dream_skin::DreamSkinStatus> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::dream_skin::start_dream_skin_injector(port)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("start_dream_skin_injector task failed: {e}"))
+    .and_then(|r| r);
+    match result {
+        Ok(status) => ok("Codex 主题注入已启动。", status),
+        Err(_e) => failed("启动失败", codex_plus_core::dream_skin::get_dream_skin_status()),
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub async fn stop_dream_skin_injector() -> CommandResult<codex_plus_core::dream_skin::DreamSkinStatus> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        codex_plus_core::dream_skin::stop_dream_skin_injector()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("stop_dream_skin_injector task failed: {e}"))
+    .and_then(|r| r);
+    match result {
+        Ok(status) => ok("Codex 主题注入已停止。", status),
+        Err(_e) => failed("停止失败", codex_plus_core::dream_skin::get_dream_skin_status()),
+    }
 }
 
 #[cfg(test)]

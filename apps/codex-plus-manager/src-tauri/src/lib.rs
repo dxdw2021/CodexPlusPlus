@@ -46,6 +46,139 @@ pub fn run() {
             main_window.open_devtools();
             install_tray(app)?;
             register_main_window_events(main_window);
+            // 在管理工具启动时，自动在后台启动 dream skin 注入
+            // 等待 CDP 就绪后获取 browser ID 并启动 injector
+            let default_port = 9229u16;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let theme_ok = codex_plus_core::dream_skin::check_base_theme_installed();
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.auto_dream_skin",
+                    serde_json::json!({"debug_port": default_port, "theme_installed": theme_ok}),
+                );
+                if !theme_ok {
+                    return;
+                }
+                // 等待 CDP 端点就绪（最多 60 秒，每 1 秒重试一次）
+                let browser_id = (|| -> Option<String> {
+                    use std::io::{Read, Write};
+                    use std::net::TcpStream;
+                    use std::time::Duration;
+                    for attempt in 0..60 {
+                        // 尝试连接 CDP 端点
+                        let mut stream = match TcpStream::connect_timeout(
+                            &"127.0.0.1:9229".parse().ok()?,
+                            Duration::from_secs(2),
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                if attempt == 0 || attempt == 10 || attempt == 30 || attempt == 50 {
+                                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                                        "manager.auto_dream_skin_wait",
+                                        serde_json::json!({"debug_port": default_port, "attempt": attempt, "error": e.to_string()}),
+                                    );
+                                }
+                                std::thread::sleep(Duration::from_secs(1));
+                                continue;
+                            }
+                        };
+                        // 连接成功，设置读超时
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let request = "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:9229\r\nConnection: close\r\n\r\n";
+                        if stream.write_all(request.as_bytes()).is_err() {
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                        // 读取响应（循环读取，超时即停止）
+                        let mut response = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => response.extend_from_slice(&buf[..n]),
+                                Err(_) => break,
+                            }
+                            if response.len() > 4096 { break; }
+                        }
+                        if response.is_empty() {
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                        let response_str = String::from_utf8_lossy(&response);
+                        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                            "manager.auto_dream_skin_cdp_raw",
+                            serde_json::json!({"bytes_read": response.len(), "attempt": attempt}),
+                        );
+                        // 从响应体中提取 webSocketDebuggerUrl
+                        if let Some(body_start) = response_str.find("\r\n\r\n") {
+                            let body = &response_str[body_start + 4..];
+                            let key = "\"webSocketDebuggerUrl\"";
+                            if let Some(val_start) = body.find(key) {
+                                let after_key = &body[val_start + key.len()..];
+                                if let Some(quote_start) = after_key.find('"') {
+                                    let after_quote = &after_key[quote_start + 1..];
+                                    if let Some(quote_end) = after_quote.find('"') {
+                                        let url = &after_quote[..quote_end];
+                                        if let Some(id_start) = url.rfind('/') {
+                                            let id = &url[id_start + 1..];
+                                            if !id.is_empty() && id.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-') {
+                                                return Some(id.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    None
+                })();
+                let Some(browser_id) = browser_id else {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "manager.auto_dream_skin_no_browser_id",
+                        serde_json::json!({"debug_port": default_port}),
+                    );
+                    return;
+                };
+                // 查找 Node.js 和 injector 脚本路径
+                let Some(node_path) = codex_plus_core::dream_skin::find_node() else {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "manager.auto_dream_skin_no_node",
+                        serde_json::json!({"debug_port": default_port}),
+                    );
+                    return;
+                };
+                let assets_dir = codex_plus_core::dream_skin::dream_skin_assets_dir();
+                let injector_script = assets_dir.join("scripts").join("injector.mjs");
+                if !injector_script.exists() {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "manager.auto_dream_skin_no_script",
+                        serde_json::json!({"debug_port": default_port, "path": injector_script.to_string_lossy()}),
+                    );
+                    return;
+                }
+                // 直接启动 injector（不等待，detached 独立进程）
+                match std::process::Command::new(&node_path)
+                    .arg(injector_script.to_string_lossy().as_ref())
+                    .args(["--watch", "--port", &default_port.to_string(), "--browser-id", &browser_id])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(_) => {
+                        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                            "manager.auto_dream_skin_ok",
+                            serde_json::json!({"debug_port": default_port, "browser_id": browser_id, "node": node_path.to_string_lossy(), "injector": injector_script.to_string_lossy()}),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                            "manager.auto_dream_skin_spawn_fail",
+                            serde_json::json!({"debug_port": default_port, "error": e.to_string(), "node": node_path.to_string_lossy(), "injector": injector_script.to_string_lossy()}),
+                        );
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -116,6 +249,11 @@ pub fn run() {
             commands::apply_relay_injection,
             commands::apply_pure_api_injection,
             commands::clear_relay_injection,
+            commands::get_dream_skin_status,
+            commands::install_dream_skin,
+            commands::restore_dream_skin_base,
+            commands::start_dream_skin_injector,
+            commands::stop_dream_skin_injector,
             manager_exit_app,
             manager_hide_to_tray,
             update_tray_labels
