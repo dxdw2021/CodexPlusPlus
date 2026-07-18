@@ -30,6 +30,12 @@
     "targets": "all",
     "icon": [
       "icons/icon.ico"
+    ],
+    "externalBin": [
+      "bin/codex-plus-plus"
+    ],
+    "resources": [
+      "../../../assets/dream-skin/*"
     ]
   }
 }

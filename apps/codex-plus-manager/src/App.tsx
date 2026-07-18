@@ -37,6 +37,7 @@ import {
   FileCode2,
   Moon,
   Network,
+  Palette,
   Power,
   PowerOff,
   Plus,
@@ -180,6 +181,9 @@ type BackendSettings = {
   codexAppImageOverlayOpacity: number;
   codexAppImageOverlayFitMode: ImageOverlayFitMode;
   codexGoalsEnabled: boolean;
+  codexAppDreamSkinEnabled: boolean;
+  codexAppDreamSkinPort: number;
+  codexAppDreamSkinTheme: string;
   launchMode: LaunchMode;
   relayBaseUrl: string;
   relayApiKey: string;
@@ -195,6 +199,14 @@ type BackendSettings = {
 type ZedOpenStrategy = "addToFocusedWorkspace" | "reuseWindow" | "newWindow" | "default";
 type LaunchMode = "patch" | "relay";
 type ImageOverlayFitMode = "fill" | "fit" | "stretch" | "tile" | "center";
+
+type DreamSkinStatus = {
+  baseThemeInstalled: boolean;
+  injectorRunning: boolean;
+  injectorPid: number | null;
+  port: number;
+  message: string;
+};
 
 export type RelayProfile = {
   id: string;
@@ -691,7 +703,7 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "enhance" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "enhance" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings" | "theme";
 type Theme = "dark" | "light";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
@@ -700,6 +712,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "sessions", label: t("会话管理"), icon: MessageCircle },
   { id: "context", label: t("工具与插件"), icon: Network },
   { id: "enhance", label: t("Codex增强"), icon: Hammer },
+  { id: "theme", label: t("Codex 主题"), icon: Palette },
   { id: "zedRemote", label: t("Zed 远程项目"), icon: ExternalLink },
   { id: "userScripts", label: t("脚本市场"), icon: FileCode2 },
   { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
@@ -2152,6 +2165,30 @@ export function App() {
       uninstallWatcher: () => watcherAction("uninstall_watcher"),
       enableWatcher: () => watcherAction("enable_watcher"),
       disableWatcher: () => watcherAction("disable_watcher"),
+      getDreamSkinStatus: async () => {
+        const result = await call<DreamSkinStatus>("get_dream_skin_status");
+        return result;
+      },
+      installDreamSkin: async () => {
+        const result = await call<DreamSkinStatus>("install_dream_skin");
+        if (result) showNotice(t("Codex 主题"), result.message, result.status);
+        return result;
+      },
+      restoreDreamSkinBase: async () => {
+        const result = await call<DreamSkinStatus>("restore_dream_skin_base");
+        if (result) showNotice(t("Codex 主题"), result.message, result.status);
+        return result;
+      },
+      startDreamSkinInjector: async (port: number) => {
+        const result = await call<DreamSkinStatus>("start_dream_skin_injector", { port });
+        if (result) showNotice(t("Codex 主题"), result.message, result.status);
+        return result;
+      },
+      stopDreamSkinInjector: async () => {
+        const result = await call<DreamSkinStatus>("stop_dream_skin_injector");
+        if (result) showNotice(t("Codex 主题"), result.message, result.status);
+        return result;
+      },
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
     [route, launchForm, settingsForm, settings, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders],
@@ -2317,6 +2354,9 @@ export function App() {
           ) : null}
           {route === "settings" ? (
             <SettingsScreen settings={settings} theme={theme} form={settingsForm} onFormChange={setSettingsForm} actions={actions} />
+          ) : null}
+          {route === "theme" ? (
+            <ThemeScreen form={settingsForm} onFormChange={setSettingsForm} actions={actions} />
           ) : null}
         </section>
       </main>
@@ -3847,6 +3887,39 @@ function SettingsScreen({
         </CardContent>
       </Panel>
       <Panel>
+        <CardHead title={t("Codex 主题")} detail={t("通过 CDP 注入为 Codex 桌面端应用主题皮肤")} />
+        <CardContent>
+          <label className="check-row">
+            <input
+              checked={form.codexAppDreamSkinEnabled}
+              onChange={(event) =>
+                onFormChange({ ...form, codexAppDreamSkinEnabled: event.currentTarget.checked })
+              }
+              type="checkbox"
+            />
+            <span>{t("启用 Codex 主题 (Dream Skin)")}</span>
+          </label>
+          <Field label={t("CDP 端口")}>
+            <Input
+              min={1024}
+              max={65535}
+              type="number"
+              value={form.codexAppDreamSkinPort}
+              onChange={(event) =>
+                onFormChange({
+                  ...form,
+                  codexAppDreamSkinPort: clampNumber(Number(event.currentTarget.value), 1024, 65535),
+                })
+              }
+            />
+          </Field>
+          <Toolbar>
+            <Button onClick={() => void actions.installDreamSkin()}>{t("安装基础主题")}</Button>
+            <Button variant="secondary" onClick={() => void actions.restoreDreamSkinBase()}>{t("恢复基础主题")}</Button>
+          </Toolbar>
+        </CardContent>
+      </Panel>
+      <Panel>
         <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
         <CardContent>
           <Field label={t("额外参数")}>
@@ -3899,6 +3972,124 @@ function LogsPanel({ logs, actions }: { logs: LogsResult | null; actions: Action
         </Toolbar>
       </CardContent>
     </Panel>
+  );
+}
+
+function ThemeScreen({
+  form,
+  onFormChange,
+  actions,
+}: {
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
+  actions: Actions;
+}) {
+  const [dreamSkinStatus, setDreamSkinStatus] = useState<DreamSkinStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const refreshStatus = async () => {
+    setLoading(true);
+    try {
+      const result = await actions.getDreamSkinStatus();
+      if (result) setDreamSkinStatus(result);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshStatus();
+  }, []);
+
+  return (
+    <>
+      <Panel>
+        <CardHead title={t("Codex 主题")} detail={t("通过 CDP 注入为 Codex 桌面端应用主题皮肤")} />
+        <CardContent>
+          <label className="switch-row">
+            <input
+              checked={form.codexAppDreamSkinEnabled}
+              onChange={(event) => {
+                const next = { ...form, codexAppDreamSkinEnabled: event.currentTarget.checked };
+                onFormChange(next);
+                void actions.saveSettingsValue(next, true);
+              }}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("启用 Codex 主题 (Dream Skin)")}</strong>
+              <small>{t("为 Codex 桌面端应用注入主题皮肤，需 Node.js 22+ 环境")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          <Field label={t("CDP 端口")}>
+            <Input
+              min={1024}
+              max={65535}
+              type="number"
+              value={form.codexAppDreamSkinPort}
+              onChange={(event) =>
+                onFormChange({
+                  ...form,
+                  codexAppDreamSkinPort: clampNumber(Number(event.currentTarget.value), 1024, 65535),
+                })
+              }
+            />
+          </Field>
+          <Field label={t("主题皮肤")}>
+            <select
+              value={form.codexAppDreamSkinTheme || "purple"}
+              onChange={(event) => {
+                const next = { ...form, codexAppDreamSkinTheme: event.currentTarget.value };
+                onFormChange(next);
+                void actions.saveSettingsValue(next, true);
+              }}
+              className="input"
+              style={{ width: "100%" }}
+            >
+              <option value="purple">{t("紫色梦境")}</option>
+              <option value="blue">{t("蓝色海洋")}</option>
+              <option value="sakura">{t("樱花纷飞")}</option>
+            </select>
+          </Field>
+        </CardContent>
+      </Panel>
+      <Panel>
+        <CardHead title={t("主题状态")} detail={t("查看和管理 Codex 主题的运行状态")} />
+        <CardContent>
+          <div className="status-block">
+            <div className="status-item">
+              <strong>{t("基础主题")}</strong>
+              <span className={dreamSkinStatus?.baseThemeInstalled ? "status-ok" : "status-inactive"}>
+                {dreamSkinStatus?.baseThemeInstalled ? t("已安装") : t("未安装")}
+              </span>
+            </div>
+            <div className="status-item">
+              <strong>{t("注入状态")}</strong>
+              <span className={dreamSkinStatus?.injectorRunning ? "status-ok" : "status-inactive"}>
+                {dreamSkinStatus?.injectorRunning
+                  ? tf("运行中 (PID: {0})", [String(dreamSkinStatus.injectorPid ?? "")])
+                  : t("未运行")}
+              </span>
+            </div>
+            <div className="status-item">
+              <strong>{t("CDP 端口")}</strong>
+              <span>{dreamSkinStatus?.port ?? form.codexAppDreamSkinPort}</span>
+            </div>
+          </div>
+          <div className="status-message">
+            {dreamSkinStatus?.message ?? t("正在检查状态...")}
+          </div>
+          <Toolbar>
+            <Button onClick={() => void actions.installDreamSkin()}>{t("安装基础主题")}</Button>
+            <Button variant="secondary" onClick={() => void actions.restoreDreamSkinBase()}>{t("恢复基础主题")}</Button>
+            <Button variant="outline" onClick={() => void refreshStatus()}>
+              {t("刷新状态")}
+            </Button>
+          </Toolbar>
+        </CardContent>
+      </Panel>
+    </>
   );
 }
 
@@ -5722,6 +5913,7 @@ function routeSubtitle(route: Route) {
     maintenance: t("入口安装、修复、Watcher 与手动启动"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
     settings: t("主题和启动参数"),
+    theme: t("通过 CDP 注入为 Codex 桌面端应用主题皮肤"),
   };
   return subtitles[route];
 }

@@ -1,0 +1,38 @@
+/* Dream Skin — 蓝色主题 */
+:root.codex-dream-skin {
+  --dream-ink: #1a3a5c;
+  --dream-purple: #3d7ece;
+  --dream-violet: #5c8cff;
+  --dream-pink: #73bdff;
+  --dream-blush: #f3f9ff;
+  --dream-pearl: rgba(251, 253, 255, .92);
+  --dream-line: rgba(122, 174, 221, .42);
+  --dream-dark-bg: #0d1a2e;
+  --dream-dark-surface: #14263d;
+  --dream-dark-card: #1a304a;
+  --dream-dark-border: rgba(92, 140, 255, .25);
+  --dream-dark-text: #d0e0f8;
+  --dream-dark-muted: #889dc8;
+}
+
+html.codex-dream-skin body {
+  background:
+    radial-gradient(circle at 78% 2%, rgba(184, 215, 255, .66), transparent 25%),
+    radial-gradient(circle at 24% 12%, rgba(171, 204, 255, .48), transparent 28%),
+    linear-gradient(135deg, #f9fcff 0%, #eef4fc 48%, #eaf0fd 100%) !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root.codex-dream-skin {
+    --dream-ink: var(--dream-dark-text);
+    --dream-blush: var(--dream-dark-surface);
+    --dream-pearl: rgba(20, 38, 61, .92);
+    --dream-line: var(--dream-dark-border);
+  }
+  html.codex-dream-skin body {
+    background:
+      radial-gradient(circle at 78% 2%, rgba(40, 80, 160, .40), transparent 25%),
+      radial-gradient(circle at 24% 12%, rgba(30, 60, 140, .35), transparent 28%),
+      linear-gradient(135deg, #0d1a2e 0%, #14263d 48%, #1a304a 100%) !important;
+  }
+}

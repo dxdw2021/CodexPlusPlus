@@ -1169,6 +1169,70 @@ fn write_codex_live_atomic(
     Ok(backup_path)
 }
 
+/// 应用 Dream Skin 基础主题到 config.toml 的 [desktop] 节
+pub fn apply_dream_skin_base_theme(home: &Path) -> anyhow::Result<()> {
+    use std::fs;
+    use toml_edit::DocumentMut;
+
+    let config_path = home.join("config.toml");
+    let existing = fs::read_to_string(&config_path).unwrap_or_default();
+    let mut doc = if existing.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        parse_toml_document(&existing)?
+    };
+
+    // 确保 [desktop] 节存在
+    if doc.get("desktop").is_none() {
+        doc["desktop"] = toml_edit::table();
+    }
+
+    // 设置主题外观
+    if let Some(desktop) = doc["desktop"].as_table_mut() {
+        desktop["appearanceTheme"] = toml_edit::value("light");
+        desktop["appearanceLightCodeThemeId"] = toml_edit::value("codex");
+        desktop["appearanceLightChromeTheme"] = toml_edit::value(
+            "{ accent = \"#B65CFF\", contrast = 64, fonts = { code = \"Cascadia Code\", ui = \"Microsoft YaHei UI\" }, ink = \"#4A235F\", opaqueWindows = true, semanticColors = { diffAdded = \"#BCE8CF\", diffRemoved = \"#F7B8CE\", skill = \"#C47BFF\" }, surface = \"#FFF4FA\" }"
+        );
+    }
+
+    crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
+    Ok(())
+}
+
+/// 恢复 Dream Skin 基础主题（移除 [desktop] 中的外观设置）
+pub fn restore_dream_skin_base_theme(home: &Path) -> anyhow::Result<()> {
+    use std::fs;
+
+    let config_path = home.join("config.toml");
+    let existing = fs::read_to_string(&config_path).unwrap_or_default();
+    let mut doc = if existing.trim().is_empty() {
+        return Ok(());
+    } else {
+        parse_toml_document(&existing)?
+    };
+
+    let keys_to_remove = [
+        "appearanceTheme",
+        "appearanceLightCodeThemeId",
+        "appearanceLightChromeTheme",
+    ];
+
+    if let Some(desktop) = doc.get_mut("desktop").and_then(Item::as_table_mut) {
+        for key in &keys_to_remove {
+            if desktop.contains_key(*key) {
+                desktop.remove(*key);
+            }
+        }
+        if desktop.is_empty() {
+            doc.remove("desktop");
+        }
+    }
+
+    crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
+    Ok(())
+}
+
 fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::Result<String> {
     let live_config = read_optional_text(&home.join("config.toml"))?;
     if live_config.trim().is_empty() {

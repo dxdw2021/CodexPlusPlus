@@ -18,6 +18,7 @@ function parseArgs(argv) {
     screenshot: null,
     reload: false,
     browserId: null,
+    theme: "purple",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -32,6 +33,7 @@ function parseArgs(argv) {
     else if (arg === "--reload") options.reload = true;
     else if (arg === "--self-test") options.mode = "self-test";
     else if (arg === "--check-payload") options.mode = "check-payload";
+    else if (arg === "--theme") options.theme = argv[++i];
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!Number.isInteger(options.port) || options.port < 1024 || options.port > 65535) {
@@ -267,14 +269,21 @@ async function connectBrowserIdentityAnchor(port, expectedBrowserId) {
 }
 
 async function loadPayload() {
+  const theme = options.theme || "purple";
+  const themeFile = theme === "purple" ? "dream-skin.css" : `theme-${theme}.css`;
   const [css, template, art] = await Promise.all([
     fs.readFile(path.join(root, "dream-skin.css"), "utf8"),
     fs.readFile(path.join(root, "renderer-inject.js"), "utf8"),
     fs.readFile(path.join(root, "dream-reference.png")),
   ]);
+  // 如果有主题覆盖文件，则追加主题样式
+  let themeCss = "";
+  try {
+    themeCss = await fs.readFile(path.join(root, themeFile), "utf8");
+  } catch {}
   const artDataUrl = `data:image/png;base64,${art.toString("base64")}`;
   return template
-    .replace("__DREAM_CSS_JSON__", JSON.stringify(css))
+    .replace("__DREAM_CSS_JSON__", JSON.stringify(css + "\n" + themeCss))
     .replace("__DREAM_ART_JSON__", JSON.stringify(artDataUrl));
 }
 

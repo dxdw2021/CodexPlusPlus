@@ -316,10 +316,21 @@ pub fn companion_binary_path_from_exe(exe: &Path, binary: &str) -> PathBuf {
     if let Some(bundle_binary) = macos_companion_binary_from_exe(exe, binary) {
         return bundle_binary;
     }
+    // 1. 先找同目录
     let same_bundle = dir.join(binary);
     if same_bundle.exists() {
         return same_bundle;
     }
+    let same_bundle_exe = dir.join(format!("{binary}{suffix}"));
+    if same_bundle_exe.exists() {
+        return same_bundle_exe;
+    }
+    // 2. 再找 bin/ 子目录（Tauri externalBin 打包路径）
+    let bin_dir = dir.join("bin").join(format!("{binary}{suffix}"));
+    if bin_dir.exists() {
+        return bin_dir;
+    }
+    // 3. 默认返回同目录路径
     dir.join(format!("{binary}{suffix}"))
 }
 

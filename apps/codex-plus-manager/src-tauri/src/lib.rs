@@ -158,9 +158,16 @@ pub fn run() {
                     return;
                 }
                 // 直接启动 injector（不等待，detached 独立进程）
+                // 从 settings 读取主题名称
+                let theme_name = codex_plus_core::settings::SettingsStore::default()
+                    .load()
+                    .ok()
+                    .map(|s| s.codex_app_dream_skin_theme)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "purple".to_string());
                 match std::process::Command::new(&node_path)
                     .arg(injector_script.to_string_lossy().as_ref())
-                    .args(["--watch", "--port", &default_port.to_string(), "--browser-id", &browser_id])
+                    .args(["--watch", "--port", &default_port.to_string(), "--browser-id", &browser_id, "--theme", &theme_name])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn()

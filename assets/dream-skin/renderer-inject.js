@@ -44,6 +44,12 @@
 
     root.classList.add("codex-dream-skin");
     root.style.setProperty("--dream-art", `url("${artUrl}")`);
+    // 检测 Codex 暗色模式（data-theme 或 CSS 变量）
+    const isDark = root.getAttribute("data-theme") === "dark" ||
+      root.classList.contains("dark") ||
+      (root.computedStyleMap?.().get("color-scheme")?.toString() === "dark") ||
+      (typeof getComputedStyle === "function" && getComputedStyle(root).getPropertyValue("color-scheme").trim() === "dark");
+    root.classList.toggle("dream-dark", isDark);
 
     let style = document.getElementById(STYLE_ID);
     if (!style) {

@@ -319,6 +319,12 @@ pub struct BackendSettings {
         deserialize_with = "deserialize_image_overlay_fit_mode"
     )]
     pub codex_app_image_overlay_fit_mode: String,
+    #[serde(rename = "codexAppDreamSkinEnabled", default)]
+    pub codex_app_dream_skin_enabled: bool,
+    #[serde(rename = "codexAppDreamSkinPort", default = "default_dream_skin_port")]
+    pub codex_app_dream_skin_port: u16,
+    #[serde(rename = "codexAppDreamSkinTheme", default)]
+    pub codex_app_dream_skin_theme: String,
     #[serde(rename = "codexGoalsEnabled", default)]
     pub codex_goals_enabled: bool,
     #[serde(rename = "launchMode", default)]
@@ -390,6 +396,9 @@ impl Default for BackendSettings {
             codex_app_image_overlay_path: String::new(),
             codex_app_image_overlay_opacity: default_image_overlay_opacity(),
             codex_app_image_overlay_fit_mode: default_image_overlay_fit_mode(),
+            codex_app_dream_skin_enabled: false,
+            codex_app_dream_skin_port: default_dream_skin_port(),
+            codex_app_dream_skin_theme: String::new(),
             codex_goals_enabled: false,
             launch_mode: LaunchMode::Patch,
             relay_base_url: default_relay_base_url(),
@@ -559,6 +568,10 @@ fn default_image_overlay_opacity() -> u8 {
 
 fn clamp_image_overlay_opacity(value: u8) -> u8 {
     value.clamp(1, 100)
+}
+
+pub fn default_dream_skin_port() -> u16 {
+    9335
 }
 
 pub fn default_image_overlay_fit_mode() -> String {
@@ -939,6 +952,17 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert(
             "codexAppImageOverlayFitMode".to_string(),
             Value::String(normalize_image_overlay_fit_mode(value)),
+        );
+    }
+    merge_bool_setting(target, source, "codexAppDreamSkinEnabled");
+    if let Some(value) = source
+        .get("codexAppDreamSkinPort")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+    {
+        target.insert(
+            "codexAppDreamSkinPort".to_string(),
+            Value::Number(serde_json::Number::from(value.clamp(1024, 65535))),
         );
     }
     if let Some(value) = source.get("codexGoalsEnabled").and_then(Value::as_bool) {

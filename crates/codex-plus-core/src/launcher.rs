@@ -2869,6 +2869,15 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
     }
 }
 
+/// 同步启动 Windows Store 打包的 Codex 应用（供 dream_skin 等模块使用）
+#[cfg(windows)]
+pub fn launch_packaged_codex_sync(app_dir: &std::path::Path, debug_port: u16) -> anyhow::Result<u32> {
+    let aumid = crate::app_paths::packaged_app_user_model_id(app_dir)
+        .ok_or_else(|| anyhow::anyhow!("无法获取 Codex 包 AUMID"))?;
+    let arguments = format!("--remote-debugging-port={debug_port} --remote-allow-origins=http://127.0.0.1:{debug_port}");
+    activate_packaged_app_blocking(&aumid, &arguments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
